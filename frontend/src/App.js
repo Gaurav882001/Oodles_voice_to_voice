@@ -714,12 +714,12 @@ const HindiTTSApp = () => {
             </li>
             <li className="flex items-start">
               <span className="text-yellow-400 mr-3 mt-1">•</span>
-              <span>Document upload and analysis (PDF, Word, Images) - Single or Multiple</span>
+              <span>Document upload and analysis (PDF, Word, Images)</span>
             </li>
           </ul>
 
           <p className="text-gray-300 leading-relaxed">
-           Simply click the microphone button to start recording, or type your message directly. Upload single or multiple documents to ask questions about their content. Select your preferred language from the dropdown. The AI will respond with both text and voice, creating a natural conversation flow.
+           Simply click the microphone button to start recording, or type your message directly. Upload single or multiple documents to ask questions about their content. Select your preferred language from the dropdown. The AI will respond with both text and voice.
           </p>
         </div>
 
