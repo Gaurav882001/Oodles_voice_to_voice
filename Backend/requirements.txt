@@ -6,3 +6,7 @@ python-dotenv
 pydantic
 typing-extensions
 langdetect
+pypdf
+python-docx
+pillow
+pytesseract

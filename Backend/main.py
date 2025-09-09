@@ -2,15 +2,21 @@ import os
 import tempfile
 import subprocess
 import logging
+import io
+import base64
 from openai import OpenAI, APIError
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import uvicorn
 from dotenv import load_dotenv
 from langdetect import detect, DetectorFactory
+import PyPDF2
+import docx
+from PIL import Image
+import pytesseract
 
 # Ensure consistent language detection
 DetectorFactory.seed = 0
@@ -44,6 +50,12 @@ class PromptRequest(BaseModel):
     prompt: str
     chat_history: List[Dict[str, str]] = []
     language: str = "english"  # default
+    
+class DocumentRequest(BaseModel):
+    query: str
+    documents: List[Dict]  # List of documents with content and metadata
+    chat_history: List[Dict[str, str]] = []
+    language: str = "english"
 
 async def transcribe_audio(file: UploadFile, selected_language: str = "english"):
     # Save uploaded file
@@ -62,8 +74,16 @@ async def transcribe_audio(file: UploadFile, selected_language: str = "english")
             "ffmpeg", "-y", "-i", tmp_in_path, "-ar", "16000", "-ac", "1", tmp_out_path
         ], check=True)
 
+        # whisper_lang = "hi" if selected_language.lower() == "hindi" else "en"
         # Force Whisper language
-        whisper_lang = "hi" if selected_language.lower() == "hindi" else "en"
+        lang = selected_language.lower()
+        if lang == "hindi":
+            whisper_lang = "hi"
+        elif lang == "arabic":
+            whisper_lang = "ar"
+        else:
+            whisper_lang = "en"
+
 
         with open(tmp_out_path, "rb") as audio_file:
             transcription = openai_client.audio.transcriptions.create(
@@ -82,10 +102,13 @@ def get_ai_response(prompt, chat_history, model="gpt-4o-mini"):
     try:
         logger.debug("Received chat_history: %s", chat_history)
         messages = [{"role": "system", "content": "You are a helpful AI assistant. Use the full conversation history to respond in the same language as the user's prompt."}]
+        
+        # Filter chat history to only include 'ai' responses (not 'document')
         for chat in chat_history:
             if "user" in chat and "ai" in chat:
                 messages.append({"role": "user", "content": chat["user"]})
                 messages.append({"role": "assistant", "content": chat["ai"]})
+        
         messages.append({"role": "user", "content": prompt})
         response = openai_client.chat.completions.create(model=model, messages=messages)
         return response.choices[0].message.content
@@ -93,9 +116,14 @@ def get_ai_response(prompt, chat_history, model="gpt-4o-mini"):
         logger.error("API Error: %s", str(e))
         raise HTTPException(status_code=400, detail=str(e))
 
-def generate_tts(text, language):
-    # Select voice based on language
-    voice = "alloy" if language == "en" else "nova" if language == "hi" else "alloy"
+def generate_tts(text, language_code):
+    voice_map = {
+        "en": "alloy",
+        "hi": "alloy",  
+        "ar": "alloy",  
+    }
+    voice = voice_map.get(language_code, "alloy")
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
         speech_path = tmp_file.name
     try:
@@ -109,6 +137,246 @@ def generate_tts(text, language):
             f.write(response.content)
         return speech_path
     except APIError as e:
+        # Retry once with 'alloy' if some other voice was chosen
+        if voice != "alloy":
+            try:
+                response = openai_client.audio.speech.create(
+                    model="tts-1",
+                    voice="alloy",
+                    input=text,
+                    response_format="wav"
+                )
+                with open(speech_path, "wb") as f:
+                    f.write(response.content)
+                return speech_path
+            except APIError as e2:
+                raise HTTPException(status_code=400, detail=f"TTS error: {str(e2)}")
+        raise HTTPException(status_code=400, detail=f"TTS error: {str(e)}")
+
+def extract_text_from_pdf(file_content):
+    try:
+        pdf_content = ""
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_content))
+        for page_num in range(len(pdf_reader.pages)):
+            page = pdf_reader.pages[page_num]
+            pdf_content += page.extract_text()
+        return pdf_content
+    except Exception as e:
+        logger.error(f"Error extracting text from PDF: {str(e)}")
+        raise Exception(f"Failed to extract text from PDF: {str(e)}")
+
+def extract_text_from_docx(file_content):
+    try:
+        doc = docx.Document(io.BytesIO(file_content))
+        return " ".join([paragraph.text for paragraph in doc.paragraphs])
+    except Exception as e:
+        logger.error(f"Error extracting text from DOCX: {str(e)}")
+        raise Exception(f"Failed to extract text from DOCX: {str(e)}")
+
+def extract_text_from_image(file_content):
+    try:
+        # Open image from bytes
+        image = Image.open(io.BytesIO(file_content))
+        
+        # Convert to RGB if necessary (for PNG with transparency, etc.)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Configure tesseract for better OCR
+        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:,.<>?/~`" '
+        
+        # Extract text using OCR
+        extracted_text = pytesseract.image_to_string(image, config=custom_config)
+        
+        # Clean up the extracted text
+        extracted_text = extracted_text.strip()
+        
+        if not extracted_text:
+            # Try with different PSM mode if first attempt fails
+            custom_config = r'--oem 3 --psm 3'
+            extracted_text = pytesseract.image_to_string(image, config=custom_config).strip()
+        
+        if not extracted_text:
+            return "No text could be extracted from this image. The image might not contain readable text or the text might be too blurry/unclear for OCR processing."
+            
+        return extracted_text
+        
+    except Exception as e:
+        logger.error(f"Error extracting text from image: {str(e)}")
+        # Don't raise an exception, return a helpful message instead
+        return f"Error processing image: Could not extract text from the image. Please ensure the image contains clear, readable text. Error details: {str(e)}"
+
+def process_document(file: UploadFile) -> tuple:
+    """
+    Process document and return (text_content, is_image, image_base64)
+    """
+    try:
+        # Read file content
+        content = file.file.read()
+        
+        # Reset file pointer for potential re-reading
+        file.file.seek(0)
+        
+        # Get file extension
+        file_extension = file.filename.split(".")[-1].lower() if file.filename else ""
+        
+        logger.info(f"Processing file: {file.filename}, extension: {file_extension}, size: {len(content)} bytes")
+        
+        # Check if it's an image file
+        is_image = file_extension in ["jpg", "jpeg", "png", "bmp", "tiff", "tif", "webp"]
+        image_base64 = None
+        
+        if file_extension == "pdf":
+            text_content = extract_text_from_pdf(content)
+        elif file_extension in ["docx", "doc"]:
+            text_content = extract_text_from_docx(content)
+        elif is_image:
+            # For images, extract text via OCR but also store the image data
+            text_content = extract_text_from_image(content)
+            # Convert image to base64 for vision API
+            image_base64 = base64.b64encode(content).decode('utf-8')
+        elif file_extension in ["txt"]:
+            # Handle text files
+            try:
+                text_content = content.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text_content = content.decode("latin-1")
+                except UnicodeDecodeError:
+                    text_content = content.decode("utf-8", errors="ignore")
+        else:
+            # For unsupported files, attempt text extraction as fallback
+            try:
+                text_content = content.decode("utf-8", errors="ignore")
+            except Exception:
+                raise Exception(f"Unsupported file format: {file_extension}")
+        
+        return text_content, is_image, image_base64
+                
+    except Exception as e:
+        logger.error(f"Error processing document: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Cannot process this document: {str(e)}")
+
+def get_language_name(language_code):
+    """Convert language code to full name for better prompts"""
+    language_map = {
+        "english": "English",
+        "hindi": "Hindi",
+        "arabic": "Arabic"
+    }
+    return language_map.get(language_code.lower(), "English")
+
+def get_ai_response_from_documents(query, documents, chat_history=None, model="gpt-4o-mini", language="english"):
+    """
+    Function to handle queries across multiple documents
+    """
+    try:
+        if chat_history is None:
+            chat_history = []
+        
+        # Get the full language name for better prompts
+        language_name = get_language_name(language)
+        
+        # Build consolidated document content
+        consolidated_content = ""
+        has_images = False
+        image_contents = []
+        
+        for i, doc in enumerate(documents, 1):
+            filename = doc.get("filename", f"Document {i}")
+            content = doc.get("content", "")
+            is_image = doc.get("is_image", False)
+            image_data = doc.get("image_data")
+            
+            if is_image and image_data:
+                has_images = True
+                image_contents.append({
+                    "filename": filename,
+                    "content": content,
+                    "image_data": image_data
+                })
+            
+            consolidated_content += f"\n\n=== {filename} ===\n{content}"
+        
+        # Build messages array
+        messages = []
+        
+        if has_images:
+            # Use vision model for handling images
+            model = "gpt-4o-mini"
+            
+            system_prompt = f"""You are a multi-document analysis assistant. You can analyze both text documents and images. Your job is to answer questions based STRICTLY on the provided documents.
+
+CRITICAL RULES:
+1. RESPOND ONLY IN {language_name.upper()} - This is mandatory regardless of what language appears in the documents
+2. ONLY use information from the provided documents (text and images)
+3. When referencing information, mention which document it comes from
+4. If the documents don't contain the requested information, clearly state: "The documents do not contain information about [topic]" (translate this message to {language_name})
+5. For image content, only describe what you can directly observe
+6. Never provide general knowledge or information from outside the documents
+7. Always respond in {language_name}
+
+Available Documents:
+{consolidated_content}
+
+Remember: Answer ONLY from the provided documents and ALWAYS respond in {language_name}."""
+
+            messages.append({"role": "system", "content": system_prompt})
+            
+            # Filter chat history to only include 'document' responses
+            for chat in chat_history:
+                if "user" in chat and "document" in chat:
+                    messages.append({"role": "user", "content": chat["user"]})
+                    messages.append({"role": "assistant", "content": chat["document"]})
+            
+            # Add the current query with images
+            user_content = [{"type": "text", "text": f"Please respond in {language_name}. {query}"}]
+            
+            # Add images to the message
+            for img in image_contents:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{img['image_data']}"
+                    }
+                })
+            
+            messages.append({"role": "user", "content": user_content})
+            
+        else:
+            # Text-only documents
+            system_prompt = f"""You are a multi-document analysis assistant. Your ONLY job is to answer questions based STRICTLY on the provided documents.
+
+CRITICAL RULES:
+1. RESPOND ONLY IN {language_name.upper()} - This is mandatory regardless of what language the documents are written in
+2. ONLY use information from the provided documents
+3. When referencing information, mention which document it comes from (e.g., "According to [filename]...")
+4. If the documents don't contain the requested information, clearly state: "The documents do not contain information about [topic]" (translate this message to {language_name})
+5. Never provide general knowledge or information from outside the documents
+6. Always quote or reference specific parts of the documents when answering
+7. Always respond in {language_name}
+
+Available Documents:
+{consolidated_content}
+
+Remember: Answer ONLY from these documents and ALWAYS respond in {language_name}. If information is not in any document, say so clearly in {language_name}."""
+
+            messages.append({"role": "system", "content": system_prompt})
+            
+            # Filter chat history to only include 'document' responses
+            for chat in chat_history:
+                if "user" in chat and "document" in chat:
+                    messages.append({"role": "user", "content": chat["user"]})
+                    messages.append({"role": "assistant", "content": chat["document"]})
+            
+            # Add the current query with language instruction
+            messages.append({"role": "user", "content": f"Please respond in {language_name}. {query}"})
+        
+        response = openai_client.chat.completions.create(model=model, messages=messages, max_tokens=2000)
+        return response.choices[0].message.content
+        
+    except APIError as e:
+        logger.error(f"API Error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
 from fastapi import Form
@@ -144,19 +412,125 @@ async def generate_response_endpoint(request: PromptRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/tts")
 async def tts_endpoint(request: PromptRequest):
     try:
         if not request.prompt.strip():
             raise HTTPException(status_code=422, detail="Text cannot be empty")
 
-        language_code = "en" if request.language.lower() == "english" else "hi"
+        lang_lower = request.language.lower()
+        if lang_lower == "english":
+            language_code = "en"
+        elif lang_lower == "hindi":
+            language_code = "hi"
+        elif lang_lower == "arabic":   # NEW
+            language_code = "ar"
+        else:
+            language_code = "en"
+
         speech_path = generate_tts(request.prompt, language_code)
         return FileResponse(speech_path, media_type="audio/wav", filename="response.wav")
+    except HTTPException as e:
+        # keep the original status (avoid turning 400 into 500)
+        raise e
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload_documents")
+async def upload_documents_endpoint(
+    files: List[UploadFile] = File(...),
+    query: str = Form(""),
+    language: str = Form("english"),
+    chat_history: str = Form("[]")  # JSON string of chat history
+):
+    try:
+        import json
+        # Parse chat history from string
+        chat_history_parsed = json.loads(chat_history)
+        
+        processed_documents = []
+        
+        # Process each document
+        for file in files:
+            logger.info(f"Processing file: {file.filename}, content_type: {file.content_type}")
+            
+            try:
+                # Extract text from document and check if it's an image
+                document_text, is_image, image_base64 = process_document(file)
+                
+                if not document_text.strip() and not is_image:
+                    logger.warning(f"Could not extract text from {file.filename}")
+                    continue
+                
+                processed_documents.append({
+                    "filename": file.filename,
+                    "content": document_text,
+                    "is_image": is_image,
+                    "image_data": image_base64,
+                    "text_length": len(document_text)
+                })
+                
+                logger.info(f"Successfully processed {file.filename}: {len(document_text)} characters, is_image: {is_image}")
+                
+            except Exception as e:
+                logger.error(f"Error processing {file.filename}: {str(e)}")
+                continue
+        
+        if not processed_documents:
+            raise HTTPException(status_code=400, detail="Could not process any of the uploaded documents")
+        
+        # If there's a query, get AI response from all documents
+        if query.strip():
+            ai_response = get_ai_response_from_documents(
+                query,
+                processed_documents,
+                chat_history_parsed,
+                language=language
+            )
+            return {
+                "success": True,
+                "documents": processed_documents,
+                "response": ai_response,
+                "language": language,
+                "document_count": len(processed_documents)
+            }
+        else:
+            # Just return processed documents if no query
+            return {
+                "success": True,
+                "documents": processed_documents,
+                "response": f"Successfully processed {len(processed_documents)} document(s). You can ask questions about them now.",
+                "language": language,
+                "document_count": len(processed_documents)
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in upload_multiple_documents: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/query_documents")
+async def query_documents_endpoint(request: DocumentRequest):
+    try:
+        if not request.query.strip() or not request.documents:
+            raise HTTPException(status_code=422, detail="Query and documents cannot be empty")
+        
+        ai_response = get_ai_response_from_documents(
+            request.query,
+            request.documents,
+            request.chat_history,
+            language=request.language
+        )
+        
+        return {"response": ai_response, "language": request.language}
+    except Exception as e:
+        logger.error(f"Error in query_documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+
+
+
+
+
