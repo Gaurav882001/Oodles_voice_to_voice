@@ -28,11 +28,22 @@ const HindiTTSApp = () => {
 
   const languages = ['Hindi', 'English', 'Arabic'];
 
-  const cleanup = () => {
+  // Function to stop any currently playing audio
+  const stopCurrentAudio = () => {
     if (audioRef.current) {
       audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      // Clear the src to fully stop the audio
       audioRef.current.src = '';
+      // Remove any existing event listeners to prevent memory leaks
+      audioRef.current.onended = null;
+      audioRef.current.onerror = null;
+      audioRef.current.oncanplaythrough = null;
     }
+  };
+
+  const cleanup = () => {
+    stopCurrentAudio();
     
     if (processingControllerRef.current) {
       processingControllerRef.current.abort();
@@ -51,13 +62,8 @@ const HindiTTSApp = () => {
 
   // Helper function to get relevant chat history based on current mode
   const getRelevantChatHistory = () => {
-    if (documentMode) {
-      // In document mode, return only entries with 'document' responses
-      return chatHistory.filter(chat => "document" in chat);
-    } else {
-      // In regular mode, return only entries with 'ai' responses
-      return chatHistory.filter(chat => "ai" in chat);
-    }
+    // Always return full chat history for better context
+    return chatHistory;
   };
 
   const startRecording = async () => {
@@ -151,6 +157,9 @@ const HindiTTSApp = () => {
   };
 
   const processAudio = async (audioBlob, retryCount = 0, maxRetries = 3) => {
+    // Stop any currently playing audio before processing new audio
+    stopCurrentAudio();
+    
     processingControllerRef.current = new AbortController();
     console.log('Processing audio blob of size:', audioBlob.size);
     
@@ -192,6 +201,14 @@ const HindiTTSApp = () => {
       
       // If in document mode, use document query endpoint
       if (documentMode && documents && documents.length > 0) {
+        // Check if the transcription is meaningful before processing
+        if (!isMeaningfulQuery(transcription)) {
+          const response = getUnclearQueryResponse();
+          setChatHistory(prev => [...prev, { user: transcription, document: response }]);
+          setStatus('Oodles technologies');
+          setIsProcessing(false);
+          return;
+        }
         await sendDocumentQuery(transcription);
         return;
       }
@@ -257,19 +274,33 @@ const HindiTTSApp = () => {
         
         const audioBlobTTS = await ttsResponse.blob();
         const audioUrl = URL.createObjectURL(audioBlobTTS);
+        
+        // Stop any existing audio before creating new one
+        stopCurrentAudio();
+        
         audioRef.current = new Audio(audioUrl);
+        
+        setStatus('AI is responding...');
         
         audioRef.current.oncanplaythrough = () => {
           audioRef.current.play().catch(err => {
             console.error('Audio playback error:', err);
-            setStatus('AI response received (text only)');
+            setStatus('Oodles technologies'); // Reset status on playback error
           });
         };
         
-        setStatus('AI is responding...');
+        // Add event listener for when audio ends
+        audioRef.current.onended = () => {
+          setStatus('Oodles technologies'); // Reset status when audio finishes
+        };
+        
+        audioRef.current.onerror = () => {
+          setStatus('Oodles technologies'); // Reset status on audio error
+        };
+        
       } catch (ttsError) {
         console.error('TTS Error:', ttsError);
-        setStatus('AI response received (text only)');
+        setStatus('Oodles technologies'); // Reset status on TTS error
       }
     } catch (err) {
       if (err.name === 'AbortError') {
@@ -299,13 +330,90 @@ const HindiTTSApp = () => {
     }
   };
 
+  // List of generic acknowledgments to handle locally
+  const GENERIC_ACKS = [
+    'ok', 'okay', 'thank you', 'thanks', 'thx', 'k', 'kk', 'cool', 'great', 'nice', 'alright', 'sure', 'fine', 'noted', 'got it', 'roger', 'yup', 'yes', 'ya', 'yaar', 'acha', 'shukriya', 'dhanyavad', 'done', 'welcome', 'no', 'bye', 'see you', 'see ya', 'goodbye', 'good bye', 'ciao', 'tata', 'tc', 'take care'
+  ];
+
+  const isGenericAck = (text) => {
+    const normalized = text.trim().toLowerCase();
+    return GENERIC_ACKS.some(ack => normalized === ack || normalized.startsWith(ack + ' '));
+  };
+
+  // Function to check if a query seems meaningless or unclear
+  const isMeaningfulQuery = (text) => {
+    const normalized = text.trim().toLowerCase();
+    
+    // Check minimum length
+    if (normalized.length <= 1) {
+      return false;
+    }
+    
+    // Check for common gibberish patterns
+    const gibberishPatterns = [
+      'otay', 'emjgr', 'thik', 'hmm', 'uhh', 'umm', 'err', 'ahh', 'ohh',
+      'xyz', 'abc', 'qwe', 'asd', 'zxc', 'dfg', 'hjk', 'vbn', 'mnb'
+    ];
+    
+    if (gibberishPatterns.includes(normalized)) {
+      return false;
+    }
+    
+    // Check if it's mostly random characters (less than 50% vowels for words longer than 3 chars)
+    if (normalized.length > 3) {
+      const vowels = 'aeiou';
+      const vowelCount = normalized.split('').filter(char => vowels.includes(char)).length;
+      const vowelRatio = vowelCount / normalized.length;
+      
+      if (vowelRatio < 0.2) { // Less than 20% vowels indicates possible gibberish
+        return false;
+      }
+    }
+    
+    return true;
+  };
+
+  // Function to get appropriate response for unclear queries
+  const getUnclearQueryResponse = () => {
+    if (selectedLanguage.toLowerCase() === 'hindi') {
+      return "कृपया अपना प्रश्न स्पष्ट रूप से पूछें। मैं आपका प्रश्न समझ नहीं पाया।";
+    } else if (selectedLanguage.toLowerCase() === 'arabic') {
+      return "يرجى توضيح سؤالك. لم أفهم استفسارك.";
+    } else {
+      return "Please clarify your question. I didn't understand your query. Could you please rephrase it more clearly?";
+    }
+  };
+
   const sendTextMessage = async () => {
     if (!textInput.trim() || isProcessing) return;
-    
+
     const messageText = textInput.trim();
     setTextInput('');
     setIsProcessing(true);
     setStatus('Processing your message...');
+
+    // Stop any currently playing audio when sending new text message
+    stopCurrentAudio();
+
+    // If in document mode, handle special cases
+    if (documentMode && documents && documents.length > 0) {
+      // Handle generic acknowledgments locally
+      if (isGenericAck(messageText)) {
+        setChatHistory(prev => [...prev, { user: messageText, document: "Let me know if you have a question about the document(s)." }]);
+        setStatus('Oodles technologies');
+        setIsProcessing(false);
+        return;
+      }
+      
+      // Handle unclear/meaningless queries locally
+      if (!isMeaningfulQuery(messageText)) {
+        const response = getUnclearQueryResponse();
+        setChatHistory(prev => [...prev, { user: messageText, document: response }]);
+        setStatus('Oodles technologies');
+        setIsProcessing(false);
+        return;
+      }
+    }
 
     try {
       // If in document mode, use document query endpoint
@@ -313,11 +421,11 @@ const HindiTTSApp = () => {
         await sendDocumentQuery(messageText);
         return;
       }
-      
+
       // Get relevant chat history based on current mode
       const relevantHistory = getRelevantChatHistory();
       console.log('Relevant Chat History before request:', JSON.stringify(relevantHistory));
-      
+
       const aiResponse = await fetch(`${API_URL}/generate_response`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -327,7 +435,7 @@ const HindiTTSApp = () => {
           language: selectedLanguage.toLowerCase()
         }),
       });
-      
+
       if (!aiResponse.ok) {
         const errorData = await aiResponse.json();
         if (aiResponse.status === 401 || 
@@ -337,7 +445,7 @@ const HindiTTSApp = () => {
         }
         throw new Error(`AI response failed.`);
       }
-      
+
       const { response } = await aiResponse.json();
       console.log('AI Response:', response);
 
@@ -356,22 +464,37 @@ const HindiTTSApp = () => {
             language: selectedLanguage.toLowerCase()
           }),
         });
-        
+
         if (ttsResponse.ok) {
           const audioBlobTTS = await ttsResponse.blob();
           const audioUrl = URL.createObjectURL(audioBlobTTS);
+
+          // Stop any existing audio before creating new one
+          stopCurrentAudio();
+
           audioRef.current = new Audio(audioUrl);
+
+          setStatus('AI is responding...');
+
+          // Add event listeners for audio completion
+          audioRef.current.onended = () => {
+            setStatus('Oodles technologies'); // Reset status when audio finishes
+          };
+
+          audioRef.current.onerror = () => {
+            setStatus('Oodles technologies'); // Reset status on audio error
+          };
+
           audioRef.current.play().catch(err => {
             console.error('Audio playback error:', err);
-            setStatus('AI response received');
+            setStatus('Oodles technologies'); // Reset status on playback error
           });
-          setStatus('AI is responding...');
         } else {
-          setStatus('AI response received');
+          setStatus('Oodles technologies'); // Reset status if TTS fails
         }
       } catch (ttsError) {
         console.error('TTS Error:', ttsError);
-        setStatus('AI response received');
+        setStatus('Oodles technologies'); // Reset status on TTS error
       }
     } catch (err) {
       console.error('Error processing message:', err);
@@ -504,9 +627,20 @@ const HindiTTSApp = () => {
   const sendDocumentQuery = async (query = textInput) => {
     if (!documents || documents.length === 0 || !query.trim() || isProcessing) return;
     
+    // Additional validation for meaningful queries
+    if (!isMeaningfulQuery(query.trim())) {
+      const response = getUnclearQueryResponse();
+      setChatHistory(prev => [...prev, { user: query, document: response }]);
+      setStatus('Oodles technologies');
+      return;
+    }
+    
     setTextInput('');
     setIsProcessing(true);
     setStatus('Processing your document query...');
+    
+    // Stop any currently playing audio when sending new document query
+    stopCurrentAudio();
     
     try {
       // Get relevant chat history for document mode
@@ -545,18 +679,33 @@ const HindiTTSApp = () => {
         if (ttsResponse.ok) {
           const audioBlobTTS = await ttsResponse.blob();
           const audioUrl = URL.createObjectURL(audioBlobTTS);
+          
+          // Stop any existing audio before creating new one
+          stopCurrentAudio();
+          
           audioRef.current = new Audio(audioUrl);
+          
+          setStatus('AI is responding...');
+          
+          // Add event listeners for audio completion
+          audioRef.current.onended = () => {
+            setStatus('Oodles technologies'); // Reset status when audio finishes
+          };
+          
+          audioRef.current.onerror = () => {
+            setStatus('Oodles technologies'); // Reset status on audio error
+          };
+          
           audioRef.current.play().catch(err => {
             console.error('Audio playback error:', err);
-            setStatus('AI response received');
+            setStatus('Oodles technologies'); // Reset status on playback error
           });
-          // setStatus('AI is responding...');
         } else {
-          setStatus('AI response received');
+          setStatus('Oodles technologies'); // Reset status if TTS fails
         }
       } catch (ttsError) {
         console.error('TTS Error:', ttsError);
-        setStatus('AI response received');
+        setStatus('Oodles technologies'); // Reset status on TTS error
       }
     } catch (error) {
       console.error('Error processing document query:', error);
@@ -745,7 +894,7 @@ const HindiTTSApp = () => {
                 <div className="flex items-center space-x-2">
                   <span className="text-xs text-gray-300 truncate max-w-[100px]">
                     {documents.length === 1 ?
-                      `${documents[0].filename} ${documents[0].is_image ? '�️' : '📄'}` :
+                      `${documents[0].filename} ${documents[0].is_image ? '🖼️' : '📄'}` :
                       `${documents.length} documents`
                     }
                   </span>

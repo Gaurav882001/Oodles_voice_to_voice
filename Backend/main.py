@@ -266,6 +266,48 @@ def get_language_name(language_code):
     }
     return language_map.get(language_code.lower(), "English")
 
+def is_meaningful_query(query):
+    """
+    Check if the query is meaningful and not just gibberish or very short unclear text
+    """
+    query = query.strip().lower()
+    
+    # Check if query is too short and doesn't contain meaningful words
+    if len(query) <= 2:
+        return False
+    
+    # List of common gibberish patterns or very unclear single words
+    gibberish_patterns = [
+        'otay', 'emjgr', 'thik', 'hmm', 'uhh', 'umm', 'err', 'ahh', 'ohh',
+        'xyz', 'abc', 'qwe', 'asd', 'zxc', 'dfg', 'hjk', 'vbn', 'mnb',
+        'test', 'testing', '123', 'hello', 'hi', 'hey'
+    ]
+    
+    # Check if query is just gibberish
+    if query in gibberish_patterns:
+        return False
+    
+    # Check if query has at least one vowel (basic language structure check)
+    vowels = 'aeiou'
+    if not any(vowel in query for vowel in vowels) and len(query) > 2:
+        # Allow some exceptions for valid consonant-only words
+        valid_consonant_words = ['by', 'my', 'try', 'why', 'sky', 'dry', 'fly', 'cry']
+        if query not in valid_consonant_words:
+            return False
+    
+    # Check for random character sequences (more than 3 consecutive consonants)
+    consonants = 'bcdfghjklmnpqrstvwxyz'
+    consonant_count = 0
+    for char in query:
+        if char in consonants:
+            consonant_count += 1
+            if consonant_count > 3:
+                return False
+        else:
+            consonant_count = 0
+    
+    return True
+
 def get_ai_response_from_documents(query, documents, chat_history=None, model="gpt-4o-mini", language="english"):
     """
     Function to handle queries across multiple documents
@@ -273,6 +315,16 @@ def get_ai_response_from_documents(query, documents, chat_history=None, model="g
     try:
         if chat_history is None:
             chat_history = []
+        
+        # Check if the query is meaningful
+        if not is_meaningful_query(query):
+            language_name = get_language_name(language)
+            if language_name == "Hindi":
+                return "कृपया अपना प्रश्न स्पष्ट रूप से पूछें। आपका प्रश्न समझ में नहीं आया। कृपया दस्तावेज़ के बारे में कोई स्पष्ट प्रश्न पूछें।"
+            elif language_name == "Arabic":
+                return "يرجى توضيح سؤالك. لم أفهم استفسارك. يرجى طرح سؤال واضح حول الوثيقة."
+            else:
+                return "Please clarify your question. I didn't understand your query. Please ask a clear question about the document(s)."
         
         # Get the full language name for better prompts
         language_name = get_language_name(language)
@@ -315,11 +367,13 @@ CRITICAL RULES:
 5. For image content, only describe what you can directly observe
 6. Never provide general knowledge or information from outside the documents
 7. Always respond in {language_name}
+8. If a query is unclear, vague, or doesn't make sense in the context of the documents, ask for clarification in {language_name}
+9. Do NOT provide previous responses or generic answers for unclear queries
 
 Available Documents:
 {consolidated_content}
 
-Remember: Answer ONLY from the provided documents and ALWAYS respond in {language_name}."""
+Remember: Answer ONLY from the provided documents and ALWAYS respond in {language_name}. If the query is unclear or not related to the document content, ask for a clearer question."""
 
             messages.append({"role": "system", "content": system_prompt})
             
@@ -355,11 +409,14 @@ CRITICAL RULES:
 5. Never provide general knowledge or information from outside the documents
 6. Always quote or reference specific parts of the documents when answering
 7. Always respond in {language_name}
+8. If a query is unclear, vague, or doesn't make sense in the context of the documents, ask for clarification in {language_name}
+9. Do NOT provide previous responses or generic answers for unclear queries
+10. If the user's question seems to be gibberish or completely unrelated to the document content, politely ask them to rephrase their question
 
 Available Documents:
 {consolidated_content}
 
-Remember: Answer ONLY from these documents and ALWAYS respond in {language_name}. If information is not in any document, say so clearly in {language_name}."""
+Remember: Answer ONLY from these documents and ALWAYS respond in {language_name}. If information is not in any document, say so clearly in {language_name}. If the query is unclear or seems meaningless, ask for clarification."""
 
             messages.append({"role": "system", "content": system_prompt})
             
@@ -380,6 +437,15 @@ Remember: Answer ONLY from these documents and ALWAYS respond in {language_name}
         raise HTTPException(status_code=400, detail=str(e))
 
 from fastapi import Form
+
+# List of generic acknowledgments and unclear expressions
+GENERIC_ACKS = [
+    'ok', 'okay', 'thank you', 'thanks', 'thx', 'k', 'kk', 'cool', 'great', 'nice', 'alright', 'sure', 'fine', 'noted', 'got it', 'roger', 'yup', 'yes', 'ya', 'yaar', 'acha', 'shukriya', 'dhanyavad', 'done', 'welcome', 'no', 'bye', 'see you', 'see ya', 'goodbye', 'good bye', 'ciao', 'tata', 'tc', 'take care', 'hmm', 'uhh', 'umm', 'err', 'ahh', 'ohh'
+]
+
+def is_generic_ack(text):
+    normalized = text.strip().lower()
+    return any(normalized == ack or normalized.startswith(ack + ' ') for ack in GENERIC_ACKS)
 
 @app.post("/transcribe")
 async def transcribe_endpoint(
@@ -447,21 +513,21 @@ async def upload_documents_endpoint(
         import json
         # Parse chat history from string
         chat_history_parsed = json.loads(chat_history)
-        
+
         processed_documents = []
-        
+
         # Process each document
         for file in files:
             logger.info(f"Processing file: {file.filename}, content_type: {file.content_type}")
-            
+
             try:
                 # Extract text from document and check if it's an image
                 document_text, is_image, image_base64 = process_document(file)
-                
+
                 if not document_text.strip() and not is_image:
                     logger.warning(f"Could not extract text from {file.filename}")
                     continue
-                
+
                 processed_documents.append({
                     "filename": file.filename,
                     "content": document_text,
@@ -469,24 +535,27 @@ async def upload_documents_endpoint(
                     "image_data": image_base64,
                     "text_length": len(document_text)
                 })
-                
+
                 logger.info(f"Successfully processed {file.filename}: {len(document_text)} characters, is_image: {is_image}")
-                
+
             except Exception as e:
                 logger.error(f"Error processing {file.filename}: {str(e)}")
                 continue
-        
+
         if not processed_documents:
             raise HTTPException(status_code=400, detail="Could not process any of the uploaded documents")
-        
+
         # If there's a query, get AI response from all documents
         if query.strip():
-            ai_response = get_ai_response_from_documents(
-                query,
-                processed_documents,
-                chat_history_parsed,
-                language=language
-            )
+            if is_generic_ack(query):
+                ai_response = "Let me know if you have a question about the document(s)."
+            else:
+                ai_response = get_ai_response_from_documents(
+                    query,
+                    processed_documents,
+                    chat_history_parsed,
+                    language=language
+                )
             return {
                 "success": True,
                 "documents": processed_documents,
@@ -503,7 +572,7 @@ async def upload_documents_endpoint(
                 "language": language,
                 "document_count": len(processed_documents)
             }
-            
+
     except Exception as e:
         logger.error(f"Error in upload_multiple_documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -513,14 +582,17 @@ async def query_documents_endpoint(request: DocumentRequest):
     try:
         if not request.query.strip() or not request.documents:
             raise HTTPException(status_code=422, detail="Query and documents cannot be empty")
-        
-        ai_response = get_ai_response_from_documents(
-            request.query,
-            request.documents,
-            request.chat_history,
-            language=request.language
-        )
-        
+
+        if is_generic_ack(request.query):
+            ai_response = "Let me know if you have a question about the document(s)."
+        else:
+            ai_response = get_ai_response_from_documents(
+                request.query,
+                request.documents,
+                request.chat_history,
+                language=request.language
+            )
+
         return {"response": ai_response, "language": request.language}
     except Exception as e:
         logger.error(f"Error in query_documents: {str(e)}")
